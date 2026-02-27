@@ -198,6 +198,110 @@
       border: 1px solid var(--line);
     }
 
+    .compass-wrap {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 260px;
+    }
+
+    .compass-dial {
+      position: relative;
+      width: min(260px, 88vw);
+      aspect-ratio: 1 / 1;
+      border-radius: 50%;
+      border: 1px solid var(--line);
+      background:
+        radial-gradient(circle at center, rgba(255, 255, 255, 0.94), rgba(245, 248, 246, 0.96));
+      box-shadow: inset 0 0 0 1px rgba(32, 39, 40, 0.04);
+      overflow: hidden;
+    }
+
+    .compass-cross::before,
+    .compass-cross::after {
+      content: "";
+      position: absolute;
+      background: rgba(32, 39, 40, 0.18);
+    }
+
+    .compass-cross::before {
+      width: 1px;
+      height: 100%;
+      left: 50%;
+      top: 0;
+      transform: translateX(-50%);
+    }
+
+    .compass-cross::after {
+      height: 1px;
+      width: 100%;
+      top: 50%;
+      left: 0;
+      transform: translateY(-50%);
+    }
+
+    .compass-wedge {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 86%;
+      aspect-ratio: 1 / 1;
+      border-radius: 50%;
+      background: conic-gradient(
+        from -18deg,
+        rgba(15, 141, 120, 0.45) 0deg 36deg,
+        transparent 36deg 360deg
+      );
+      transform: translate(-50%, -50%) rotate(0deg);
+      transform-origin: 50% 50%;
+      opacity: 0.22;
+      transition: opacity 120ms ease;
+    }
+
+    .compass-needle {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 4px;
+      height: 40%;
+      border-radius: 3px;
+      background: linear-gradient(to top, #1b2f31, #0f8d78);
+      transform: translate(-50%, -100%) rotate(0deg);
+      transform-origin: 50% 100%;
+      opacity: 0.22;
+      transition: opacity 120ms ease;
+    }
+
+    .compass-center {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid var(--line);
+      display: grid;
+      place-items: center;
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .compass-mark {
+      position: absolute;
+      font-size: 0.86rem;
+      font-weight: 700;
+      color: rgba(32, 39, 40, 0.72);
+      letter-spacing: 0.04em;
+    }
+
+    .compass-n { top: 8px; left: 50%; transform: translateX(-50%); color: #a53030; }
+    .compass-e { right: 10px; top: 50%; transform: translateY(-50%); }
+    .compass-s { bottom: 8px; left: 50%; transform: translateX(-50%); }
+    .compass-w { left: 10px; top: 50%; transform: translateY(-50%); }
+
     .vario-readout {
       font-size: clamp(1.8rem, 5vw, 2.6rem);
       font-weight: 700;
@@ -238,6 +342,10 @@
 
       .map-wrap {
         height: 240px;
+      }
+
+      .compass-wrap {
+        height: 220px;
       }
     }
   </style>
@@ -280,8 +388,27 @@
         <div class="canvas-wrap"><canvas id="gyroChart"></canvas></div>
       </article>
       <article class="card">
-        <h2>Magnetometer (x/y/z)</h2>
-        <div class="canvas-wrap"><canvas id="magChart"></canvas></div>
+        <h2>Heading Compass</h2>
+        <div class="compass-wrap">
+          <div class="compass-dial">
+            <div class="compass-cross"></div>
+            <div id="compassWedge" class="compass-wedge"></div>
+            <div id="compassNeedle" class="compass-needle"></div>
+            <div id="compassCenter" class="compass-center">--</div>
+            <span class="compass-mark compass-n">N</span>
+            <span class="compass-mark compass-e">E</span>
+            <span class="compass-mark compass-s">S</span>
+            <span class="compass-mark compass-w">W</span>
+          </div>
+        </div>
+      </article>
+      <article class="card">
+        <h2>Lift / Sink (m/s)</h2>
+        <div class="canvas-wrap"><canvas id="liftSinkChart"></canvas></div>
+      </article>
+      <article class="card">
+        <h2>G-Force (g)</h2>
+        <div class="canvas-wrap"><canvas id="gForceChart"></canvas></div>
       </article>
     </section>
 
@@ -325,7 +452,8 @@
     const CHART_Y_LIMITS = {
       accel: { min: -3, max: 3, unit: "g" },
       gyro: { min: -180, max: 180, unit: "deg/s" },
-      mag: { min: -200, max: 200, unit: "uT" }
+      liftSink: { min: -8, max: 8, unit: "m/s" },
+      gForce: { min: 0, max: 5, unit: "g" }
     };
 
     const ui = {
@@ -338,6 +466,9 @@
       sampleCount: document.getElementById("sampleCount"),
       buttonState: document.getElementById("buttonState"),
       headingValue: document.getElementById("headingValue"),
+      compassWedge: document.getElementById("compassWedge"),
+      compassNeedle: document.getElementById("compassNeedle"),
+      compassCenter: document.getElementById("compassCenter"),
       gLoadValue: document.getElementById("gLoadValue"),
       verticalAccelValue: document.getElementById("verticalAccelValue"),
       liftSinkValue: document.getElementById("liftSinkValue"),
@@ -467,10 +598,44 @@
       });
     }
 
+    function makeScalarChart(canvasId, seriesLabel, yTitle, yMin, yMax, color) {
+      return new Chart(document.getElementById(canvasId), {
+        type: "line",
+        data: {
+          labels: [],
+          datasets: [
+            {
+              label: seriesLabel,
+              data: [],
+              parsing: false,
+              borderColor: color,
+              backgroundColor: color,
+              pointRadius: 0,
+              borderWidth: 2,
+              tension: 0.2
+            }
+          ]
+        },
+        options: {
+          ...chartBaseOptions(),
+          scales: {
+            ...chartBaseOptions().scales,
+            y: {
+              ...chartBaseOptions().scales.y,
+              min: yMin,
+              max: yMax,
+              title: { display: true, text: yTitle }
+            }
+          }
+        }
+      });
+    }
+
     const charts = {
       accel: makeVectorChart("accelChart", CHART_Y_LIMITS.accel.unit, CHART_Y_LIMITS.accel.min, CHART_Y_LIMITS.accel.max),
       gyro: makeVectorChart("gyroChart", CHART_Y_LIMITS.gyro.unit, CHART_Y_LIMITS.gyro.min, CHART_Y_LIMITS.gyro.max),
-      mag: makeVectorChart("magChart", CHART_Y_LIMITS.mag.unit, CHART_Y_LIMITS.mag.min, CHART_Y_LIMITS.mag.max)
+      liftSink: makeScalarChart("liftSinkChart", "lift/sink", CHART_Y_LIMITS.liftSink.unit, CHART_Y_LIMITS.liftSink.min, CHART_Y_LIMITS.liftSink.max, "#a53030"),
+      gForce: makeScalarChart("gForceChart", "g-load", CHART_Y_LIMITS.gForce.unit, CHART_Y_LIMITS.gForce.min, CHART_Y_LIMITS.gForce.max, "#0f5ca8")
     };
 
     function setStatus(text) {
@@ -488,12 +653,22 @@
     function updateHeadingValue(value) {
       if (!Number.isFinite(value)) {
         ui.headingValue.textContent = "Unknown";
+        ui.compassCenter.textContent = "--";
+        ui.compassNeedle.style.transform = "translate(-50%, -100%) rotate(0deg)";
+        ui.compassWedge.style.transform = "translate(-50%, -50%) rotate(0deg)";
+        ui.compassNeedle.style.opacity = "0.22";
+        ui.compassWedge.style.opacity = "0.12";
         return;
       }
       const heading = ((value % 360) + 360) % 360;
       const cardinals = ["N", "NE", "E", "SE", "S", "SW", "W", "NW", "N"];
       const cardinal = cardinals[Math.round(heading / 45)];
       ui.headingValue.textContent = heading.toFixed(1) + "\u00b0 " + cardinal;
+      ui.compassCenter.textContent = Math.round(heading) + "\u00b0";
+      ui.compassNeedle.style.transform = "translate(-50%, -100%) rotate(" + heading.toFixed(1) + "deg)";
+      ui.compassWedge.style.transform = "translate(-50%, -50%) rotate(" + heading.toFixed(1) + "deg)";
+      ui.compassNeedle.style.opacity = "1";
+      ui.compassWedge.style.opacity = "0.5";
     }
 
     function updateGLoadValue(value) {
@@ -800,10 +975,6 @@
       return Math.abs(raw) > 1000 ? raw / GYRO_COUNTS_PER_DPS : raw;
     }
 
-    function normalizeMag(raw) {
-      return raw;
-    }
-
     function normalizeVector(v) {
       const norm = Math.hypot(v.x, v.y, v.z);
       if (!Number.isFinite(norm) || norm < 0.000001) return null;
@@ -826,6 +997,17 @@
       chart.data.datasets[0].data.push({ x: timeMs, y: scaledAxis(vector, "x", normalizer) });
       chart.data.datasets[1].data.push({ x: timeMs, y: scaledAxis(vector, "y", normalizer) });
       chart.data.datasets[2].data.push({ x: timeMs, y: scaledAxis(vector, "z", normalizer) });
+      trimChart(chart, timeMs);
+      chart.options.scales.x.min = timeMs - CHART_WINDOW_MS;
+      chart.options.scales.x.max = timeMs;
+      chart.update("none");
+    }
+
+    function pushScalar(chart, value, timeMs) {
+      chart.data.datasets[0].data.push({
+        x: timeMs,
+        y: Number.isFinite(value) ? value : null
+      });
       trimChart(chart, timeMs);
       chart.options.scales.x.min = timeMs - CHART_WINDOW_MS;
       chart.options.scales.x.max = timeMs;
@@ -1311,7 +1493,6 @@
         const chartTimeMs = toChartTimeMs(msg);
         pushVector(charts.accel, msg.accel, chartTimeMs, normalizeAccel);
         pushVector(charts.gyro, msg.gyro, chartTimeMs, normalizeGyro);
-        pushVector(charts.mag, msg.mag, chartTimeMs, normalizeMag);
         updateGravityEstimate(msg.accel);
         if (state.magCalibration.active) {
           processMagCalibrationSample(msg.mag);
@@ -1322,6 +1503,8 @@
         state.gLoad = computeGLoad(msg.accel);
         state.verticalAccelG = computeVerticalAccelG(msg.accel);
         state.liftSinkMs = updateLiftSinkEstimator(state.verticalAccelG, chartTimeMs);
+        pushScalar(charts.gForce, state.gLoad, chartTimeMs);
+        pushScalar(charts.liftSink, state.liftSinkMs, chartTimeMs);
         updateHeadingValue(state.headingDeg);
         updateGLoadValue(state.gLoad);
         updateVerticalAccelValue(state.verticalAccelG);
