@@ -7,7 +7,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <style>
     :root {
       --bg-a: #f7f2e6;
@@ -112,11 +114,6 @@
       color: var(--text);
     }
 
-    .btn-danger {
-      background: #f2dede;
-      color: var(--danger);
-    }
-
     .status {
       display: flex;
       flex-wrap: wrap;
@@ -137,7 +134,7 @@
     .grid {
       margin-top: 16px;
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      grid-template-columns: 1fr;
       gap: 12px;
     }
 
@@ -194,6 +191,38 @@
       line-height: 1.45;
     }
 
+    .map-wrap {
+      height: 320px;
+      border-radius: 10px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+    }
+
+    .vario-readout {
+      font-size: clamp(1.8rem, 5vw, 2.6rem);
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      margin: 2px 0 6px;
+    }
+
+    .vario-lift {
+      color: #0f8d78;
+    }
+
+    .vario-sink {
+      color: #a53030;
+    }
+
+    .vario-neutral {
+      color: #4d6264;
+    }
+
+    .vario-note {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
     @media (max-width: 640px) {
       body {
         padding: 12px;
@@ -206,6 +235,10 @@
       .canvas-wrap {
         height: 200px;
       }
+
+      .map-wrap {
+        height: 240px;
+      }
     }
   </style>
 </head>
@@ -214,11 +247,12 @@
     <section class="top">
       <div>
         <h1>Puck.js Live Recorder</h1>
-        <p class="sub">Connect over Bluetooth, stream sensor/button output, and plot each signal on its own chart.</p>
+        <p class="sub">Connect over Bluetooth, use puck button to start/stop streaming, and optionally run Setup Heading while auto-correction refines heading continuously.</p>
       </div>
       <div class="controls">
         <button id="connectBtn" class="btn-main">Connect Puck.js</button>
-        <button id="stopBtn" class="btn-danger" disabled>Stop Stream</button>
+        <button id="setupBtn" class="btn-secondary" disabled>Setup Heading (Optional)</button>
+        <button id="gpsBtn" class="btn-secondary">Start GPS</button>
         <button id="downloadBtn" class="btn-secondary" disabled>Download JSON</button>
         <button id="clearBtn" class="btn-secondary">Clear Charts + Log</button>
       </div>
@@ -226,6 +260,12 @@
         <div>Status: <strong id="statusText">Idle</strong></div>
         <div>Samples: <strong id="sampleCount">0</strong></div>
         <div>Button: <strong id="buttonState">Unknown</strong></div>
+        <div>Heading: <strong id="headingValue">Unknown</strong></div>
+        <div>G-load: <strong id="gLoadValue">Unknown</strong></div>
+        <div>Vertical Accel: <strong id="verticalAccelValue">Unknown</strong></div>
+        <div>Lift/Sink: <strong id="liftSinkValue">Unknown</strong></div>
+        <div>GPS: <strong id="gpsState">Off</strong></div>
+        <div>GPS Alt: <strong id="gpsAltValue">Unknown</strong></div>
       </div>
       <p id="secureWarning" class="warning" hidden>Web Bluetooth requires a secure context. Use <code>https://</code> or <code>http://localhost</code> (or <code>http://127.0.0.1</code>). Plain <code>http://</code> on LAN IPs and <code>file://</code> are blocked.</p>
     </section>
@@ -243,10 +283,17 @@
         <h2>Magnetometer (x/y/z)</h2>
         <div class="canvas-wrap"><canvas id="magChart"></canvas></div>
       </article>
-      <article class="card">
-        <h2>Button (0/1)</h2>
-        <div class="canvas-wrap"><canvas id="buttonChart"></canvas></div>
-      </article>
+    </section>
+
+    <section class="card">
+      <h2>Estimated Lift / Sink</h2>
+      <div id="varioReadout" class="vario-readout vario-neutral">Unknown</div>
+      <p id="varioSource" class="vario-note">Waiting for IMU/GPS data.</p>
+    </section>
+
+    <section class="card">
+      <h2>GPS Track</h2>
+      <div id="map" class="map-wrap"></div>
     </section>
 
     <section class="log-wrap">
@@ -262,17 +309,43 @@
     const NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
     const NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
     const NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
-    const CHART_WINDOW_MS = 10000;
+    const CHART_WINDOW_MS = 5000;
     const MAX_POINTS = 2000;
+    const MAG_CALIBRATION_MS = 15000;
+    const GRAVITY_LPF_ALPHA = 0.05;
+    const EARTH_GRAVITY_MS2 = 9.80665;
+    const VARIO_GPS_BLEND_TIME_S = 4;
+    const VARIO_IMU_DAMPING_PER_S = 0.25;
+    const AUTO_MAG_CAL_DECAY_PER_S = 0.02;
+    const AUTO_MAG_CAL_BLEND = 0.02;
+    const AUTO_MAG_CAL_MIN_RANGE = 8;
+    const MAG_CALIBRATION_KEY_PREFIX = "wario-mag-cal:";
+    const ACCEL_COUNTS_PER_G = 8192;
+    const GYRO_COUNTS_PER_DPS = 134;
+    const CHART_Y_LIMITS = {
+      accel: { min: -3, max: 3, unit: "g" },
+      gyro: { min: -180, max: 180, unit: "deg/s" },
+      mag: { min: -200, max: 200, unit: "uT" }
+    };
 
     const ui = {
       connectBtn: document.getElementById("connectBtn"),
-      stopBtn: document.getElementById("stopBtn"),
+      setupBtn: document.getElementById("setupBtn"),
+      gpsBtn: document.getElementById("gpsBtn"),
       clearBtn: document.getElementById("clearBtn"),
       downloadBtn: document.getElementById("downloadBtn"),
       statusText: document.getElementById("statusText"),
       sampleCount: document.getElementById("sampleCount"),
       buttonState: document.getElementById("buttonState"),
+      headingValue: document.getElementById("headingValue"),
+      gLoadValue: document.getElementById("gLoadValue"),
+      verticalAccelValue: document.getElementById("verticalAccelValue"),
+      liftSinkValue: document.getElementById("liftSinkValue"),
+      varioReadout: document.getElementById("varioReadout"),
+      varioSource: document.getElementById("varioSource"),
+      gpsState: document.getElementById("gpsState"),
+      gpsAltValue: document.getElementById("gpsAltValue"),
+      map: document.getElementById("map"),
       log: document.getElementById("log"),
       logCount: document.getElementById("logCount"),
       secureWarning: document.getElementById("secureWarning")
@@ -288,7 +361,45 @@
       logLines: 0,
       recorded: [],
       lastButton: null,
-      chartOriginMs: null
+      isStreaming: false,
+      headingDeg: null,
+      gLoad: null,
+      verticalAccelG: null,
+      liftSinkMs: null,
+      gravityEstimate: null,
+      vario: {
+        velocityMs: 0,
+        lastImuMs: null,
+        gpsClimbMs: null,
+        lastGpsAltM: null,
+        lastGpsTimeMs: null
+      },
+      autoMagCal: {
+        initialized: false,
+        lastUpdateMs: 0,
+        lastSaveMs: 0,
+        min: null,
+        max: null
+      },
+      gps: {
+        active: false,
+        watchId: null,
+        map: null,
+        trackLine: null,
+        marker: null,
+        centered: false
+      },
+      magCal: {
+        offset: { x: 0, y: 0, z: 0 },
+        scale: { x: 1, y: 1, z: 1 }
+      },
+      magCalibration: {
+        active: false,
+        startedAt: 0,
+        endsAt: 0,
+        min: null,
+        max: null
+      }
     };
 
     const textDecoder = new TextDecoder();
@@ -310,7 +421,17 @@
         },
         scales: {
           x: {
-            ticks: { maxTicksLimit: 6 },
+            type: "linear",
+            min: Date.now() - CHART_WINDOW_MS,
+            max: Date.now(),
+            ticks: {
+              maxTicksLimit: 6,
+              callback: function(value) {
+                if (!Number.isFinite(this.max)) return "";
+                const deltaSec = (Number(value) - this.max) / 1000;
+                return deltaSec.toFixed(1) + "s";
+              }
+            },
             grid: { color: "rgba(0,0,0,0.06)" }
           },
           y: {
@@ -320,15 +441,15 @@
       };
     }
 
-    function makeVectorChart(canvasId, yTitle) {
+    function makeVectorChart(canvasId, yTitle, yMin, yMax) {
       return new Chart(document.getElementById(canvasId), {
         type: "line",
         data: {
           labels: [],
           datasets: [
-            { label: "x", data: [], borderColor: "#0f8d78", backgroundColor: "#0f8d78", pointRadius: 0, borderWidth: 1.8, tension: 0.18 },
-            { label: "y", data: [], borderColor: "#e17b3f", backgroundColor: "#e17b3f", pointRadius: 0, borderWidth: 1.8, tension: 0.18 },
-            { label: "z", data: [], borderColor: "#0f5ca8", backgroundColor: "#0f5ca8", pointRadius: 0, borderWidth: 1.8, tension: 0.18 }
+            { label: "x", data: [], parsing: false, borderColor: "#0f8d78", backgroundColor: "#0f8d78", pointRadius: 0, borderWidth: 1.8, tension: 0.18 },
+            { label: "y", data: [], parsing: false, borderColor: "#e17b3f", backgroundColor: "#e17b3f", pointRadius: 0, borderWidth: 1.8, tension: 0.18 },
+            { label: "z", data: [], parsing: false, borderColor: "#0f5ca8", backgroundColor: "#0f5ca8", pointRadius: 0, borderWidth: 1.8, tension: 0.18 }
           ]
         },
         options: {
@@ -337,6 +458,8 @@
             ...chartBaseOptions().scales,
             y: {
               ...chartBaseOptions().scales.y,
+              min: yMin,
+              max: yMax,
               title: { display: true, text: yTitle }
             }
           }
@@ -344,44 +467,10 @@
       });
     }
 
-    function makeButtonChart() {
-      return new Chart(document.getElementById("buttonChart"), {
-        type: "line",
-        data: {
-          labels: [],
-          datasets: [
-            {
-              label: "BTN",
-              data: [],
-              borderColor: "#a53030",
-              backgroundColor: "#a53030",
-              pointRadius: 0,
-              borderWidth: 2,
-              stepped: true
-            }
-          ]
-        },
-        options: {
-          ...chartBaseOptions(),
-          scales: {
-            ...chartBaseOptions().scales,
-            y: {
-              min: -0.1,
-              max: 1.1,
-              ticks: { stepSize: 1 },
-              title: { display: true, text: "off/on" },
-              grid: { color: "rgba(0,0,0,0.08)" }
-            }
-          }
-        }
-      });
-    }
-
     const charts = {
-      accel: makeVectorChart("accelChart", "g"),
-      gyro: makeVectorChart("gyroChart", "deg/s"),
-      mag: makeVectorChart("magChart", "uT"),
-      button: makeButtonChart()
+      accel: makeVectorChart("accelChart", CHART_Y_LIMITS.accel.unit, CHART_Y_LIMITS.accel.min, CHART_Y_LIMITS.accel.max),
+      gyro: makeVectorChart("gyroChart", CHART_Y_LIMITS.gyro.unit, CHART_Y_LIMITS.gyro.min, CHART_Y_LIMITS.gyro.max),
+      mag: makeVectorChart("magChart", CHART_Y_LIMITS.mag.unit, CHART_Y_LIMITS.mag.min, CHART_Y_LIMITS.mag.max)
     };
 
     function setStatus(text) {
@@ -396,6 +485,265 @@
       ui.buttonState.textContent = value ? "On" : "Off";
     }
 
+    function updateHeadingValue(value) {
+      if (!Number.isFinite(value)) {
+        ui.headingValue.textContent = "Unknown";
+        return;
+      }
+      const heading = ((value % 360) + 360) % 360;
+      const cardinals = ["N", "NE", "E", "SE", "S", "SW", "W", "NW", "N"];
+      const cardinal = cardinals[Math.round(heading / 45)];
+      ui.headingValue.textContent = heading.toFixed(1) + "\u00b0 " + cardinal;
+    }
+
+    function updateGLoadValue(value) {
+      if (!Number.isFinite(value)) {
+        ui.gLoadValue.textContent = "Unknown";
+        return;
+      }
+      ui.gLoadValue.textContent = value.toFixed(2) + " g";
+    }
+
+    function updateVerticalAccelValue(value) {
+      if (!Number.isFinite(value)) {
+        ui.verticalAccelValue.textContent = "Unknown";
+        return;
+      }
+      ui.verticalAccelValue.textContent = value.toFixed(2) + " g";
+    }
+
+    function updateLiftSinkValue(value) {
+      if (!Number.isFinite(value)) {
+        ui.liftSinkValue.textContent = "Unknown";
+        ui.varioReadout.textContent = "Unknown";
+        ui.varioReadout.className = "vario-readout vario-neutral";
+        return;
+      }
+      const text = (value >= 0 ? "+" : "") + value.toFixed(2) + " m/s";
+      ui.liftSinkValue.textContent = text;
+      ui.varioReadout.textContent = text;
+      if (value > 0.2) {
+        ui.varioReadout.className = "vario-readout vario-lift";
+      } else if (value < -0.2) {
+        ui.varioReadout.className = "vario-readout vario-sink";
+      } else {
+        ui.varioReadout.className = "vario-readout vario-neutral";
+      }
+    }
+
+    function updateVarioSource(text) {
+      ui.varioSource.textContent = text;
+    }
+
+    function updateGpsState() {
+      ui.gpsBtn.textContent = state.gps.active ? "Stop GPS" : "Start GPS";
+      ui.gpsState.textContent = state.gps.active ? "Tracking" : "Off";
+    }
+
+    function updateGpsAltitude(altitudeMeters) {
+      if (!Number.isFinite(altitudeMeters)) {
+        ui.gpsAltValue.textContent = "Unknown";
+        return;
+      }
+      ui.gpsAltValue.textContent = altitudeMeters.toFixed(1) + " m";
+    }
+
+    function initMap() {
+      if (state.gps.map) return;
+      if (typeof L === "undefined") {
+        appendLog("[warn] Leaflet not loaded, map disabled.");
+        return;
+      }
+      state.gps.map = L.map(ui.map).setView([0, 0], 2);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap contributors"
+      }).addTo(state.gps.map);
+      state.gps.trackLine = L.polyline([], {
+        color: "#0f8d78",
+        weight: 3
+      }).addTo(state.gps.map);
+    }
+
+    function clearGpsTrack() {
+      if (state.gps.trackLine) {
+        state.gps.trackLine.setLatLngs([]);
+      }
+      if (state.gps.marker) {
+        state.gps.map.removeLayer(state.gps.marker);
+        state.gps.marker = null;
+      }
+      state.gps.centered = false;
+    }
+
+    function resetVarioEstimator() {
+      state.vario.velocityMs = 0;
+      state.vario.lastImuMs = null;
+      state.vario.gpsClimbMs = null;
+      state.vario.lastGpsAltM = null;
+      state.vario.lastGpsTimeMs = null;
+      state.liftSinkMs = null;
+      updateLiftSinkValue(null);
+      updateVarioSource("Waiting for IMU/GPS data.");
+    }
+
+    function handleGpsPosition(position) {
+      const { latitude, longitude, altitude, accuracy, speed } = position.coords;
+      const fixTime = Number.isFinite(position.timestamp) ? position.timestamp : Date.now();
+      updateGpsAltitude(altitude);
+      if (Number.isFinite(altitude)) {
+        if (Number.isFinite(state.vario.lastGpsAltM) && Number.isFinite(state.vario.lastGpsTimeMs)) {
+          const dt = (fixTime - state.vario.lastGpsTimeMs) / 1000;
+          if (dt > 0.3 && dt < 20) {
+            const rawClimb = (altitude - state.vario.lastGpsAltM) / dt;
+            const clipped = Math.max(-20, Math.min(20, rawClimb));
+            state.vario.gpsClimbMs = Number.isFinite(state.vario.gpsClimbMs)
+              ? ((0.8 * state.vario.gpsClimbMs) + (0.2 * clipped))
+              : clipped;
+            if (Number.isFinite(state.liftSinkMs)) {
+              updateVarioSource("Fused IMU + GPS altitude");
+            } else {
+              updateVarioSource("GPS altitude initializing...");
+            }
+          }
+        }
+        state.vario.lastGpsAltM = altitude;
+        state.vario.lastGpsTimeMs = fixTime;
+      }
+      if (state.gps.trackLine) {
+        state.gps.trackLine.addLatLng([latitude, longitude]);
+      }
+      if (state.gps.map) {
+        if (!state.gps.marker) {
+          state.gps.marker = L.circleMarker([latitude, longitude], {
+            radius: 6,
+            color: "#e17b3f",
+            fillColor: "#e17b3f",
+            fillOpacity: 1
+          }).addTo(state.gps.map);
+        } else {
+          state.gps.marker.setLatLng([latitude, longitude]);
+        }
+        if (!state.gps.centered) {
+          state.gps.map.setView([latitude, longitude], 14);
+          state.gps.centered = true;
+        }
+      }
+      state.recorded.push({
+        type: "gps",
+        localTimeMs: Date.now(),
+        gpsTimeMs: fixTime,
+        latitude,
+        longitude,
+        altitude,
+        speed,
+        accuracy,
+        derived: {
+          gpsClimbMs: state.vario.gpsClimbMs
+        }
+      });
+      ui.downloadBtn.disabled = state.recorded.length === 0;
+    }
+
+    function handleGpsError(error) {
+      appendLog("[warn] GPS error: " + (error && error.message ? error.message : String(error)));
+    }
+
+    function startGpsTracking() {
+      if (!window.isSecureContext) {
+        appendLog("[error] GPS requires HTTPS/localhost secure context.");
+        return;
+      }
+      if (!("geolocation" in navigator)) {
+        appendLog("[error] Geolocation unsupported in this browser.");
+        return;
+      }
+      initMap();
+      if (state.gps.active) return;
+      state.gps.watchId = navigator.geolocation.watchPosition(
+        handleGpsPosition,
+        handleGpsError,
+        { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
+      );
+      state.gps.active = true;
+      updateGpsState();
+      updateVarioSource("IMU running. Waiting for GPS altitude.");
+      appendLog("[info] GPS tracking started.");
+    }
+
+    function stopGpsTracking() {
+      if (!state.gps.active) return;
+      if (state.gps.watchId !== null) {
+        navigator.geolocation.clearWatch(state.gps.watchId);
+      }
+      state.gps.watchId = null;
+      state.gps.active = false;
+      state.vario.gpsClimbMs = null;
+      state.vario.lastGpsAltM = null;
+      state.vario.lastGpsTimeMs = null;
+      updateGpsState();
+      updateGpsAltitude(null);
+      updateVarioSource("IMU-only estimate (drift-prone). Start GPS for fused sink/lift.");
+      appendLog("[info] GPS tracking stopped.");
+    }
+
+    function toggleGpsTracking() {
+      if (state.gps.active) {
+        stopGpsTracking();
+      } else {
+        startGpsTracking();
+      }
+    }
+
+    function magCalibrationStorageKey() {
+      const deviceKey = state.device && state.device.id ? state.device.id : "default";
+      return MAG_CALIBRATION_KEY_PREFIX + deviceKey;
+    }
+
+    function loadMagCalibration() {
+      const fallback = {
+        offset: { x: 0, y: 0, z: 0 },
+        scale: { x: 1, y: 1, z: 1 }
+      };
+      try {
+        const saved = localStorage.getItem(magCalibrationStorageKey());
+        if (!saved) return fallback;
+        const parsed = JSON.parse(saved);
+        const out = {
+          offset: {
+            x: toFiniteNumber(parsed && parsed.offset && parsed.offset.x) ?? 0,
+            y: toFiniteNumber(parsed && parsed.offset && parsed.offset.y) ?? 0,
+            z: toFiniteNumber(parsed && parsed.offset && parsed.offset.z) ?? 0
+          },
+          scale: {
+            x: toFiniteNumber(parsed && parsed.scale && parsed.scale.x) ?? 1,
+            y: toFiniteNumber(parsed && parsed.scale && parsed.scale.y) ?? 1,
+            z: toFiniteNumber(parsed && parsed.scale && parsed.scale.z) ?? 1
+          }
+        };
+        return out;
+      } catch (_) {
+        return fallback;
+      }
+    }
+
+    function saveMagCalibration() {
+      try {
+        localStorage.setItem(magCalibrationStorageKey(), JSON.stringify(state.magCal));
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function hasStoredMagCalibration() {
+      try {
+        return localStorage.getItem(magCalibrationStorageKey()) !== null;
+      } catch (_) {
+        return false;
+      }
+    }
+
     function appendLog(line) {
       state.logLines += 1;
       ui.logCount.textContent = state.logLines + " lines";
@@ -406,26 +754,19 @@
       ui.log.scrollTop = ui.log.scrollHeight;
     }
 
-    function ensureChartTimes(chart) {
-      if (!Array.isArray(chart._timesMs)) {
-        chart._timesMs = [];
-      }
-      return chart._timesMs;
-    }
-
-    function shiftChartPoint(chart, times) {
-      chart.data.labels.shift();
+    function shiftChartPoint(chart) {
       chart.data.datasets.forEach((ds) => ds.data.shift());
-      times.shift();
     }
 
     function trimChart(chart, newestTimeMs) {
-      const times = ensureChartTimes(chart);
-      while (chart.data.labels.length > MAX_POINTS && times.length) {
-        shiftChartPoint(chart, times);
+      while (chart.data.datasets[0].data.length > MAX_POINTS) {
+        shiftChartPoint(chart);
       }
-      while (times.length && newestTimeMs - times[0] > CHART_WINDOW_MS) {
-        shiftChartPoint(chart, times);
+      while (
+        chart.data.datasets[0].data.length &&
+        newestTimeMs - chart.data.datasets[0].data[0].x > CHART_WINDOW_MS
+      ) {
+        shiftChartPoint(chart);
       }
     }
 
@@ -445,51 +786,349 @@
       return toFiniteNumber(vector[axis.toUpperCase()]);
     }
 
-    function formatElapsedLabel(timeMs) {
-      if (!Number.isFinite(state.chartOriginMs)) {
-        state.chartOriginMs = timeMs;
-      }
-      return ((timeMs - state.chartOriginMs) / 1000).toFixed(1) + "s";
+    function scaledAxis(vector, axis, normalizer) {
+      const value = vectorAxis(vector, axis);
+      if (value === null) return null;
+      return normalizer(value);
     }
 
-    function pushVector(chart, label, vector, timeMs) {
-      const times = ensureChartTimes(chart);
-      chart.data.labels.push(label);
-      times.push(timeMs);
-      chart.data.datasets[0].data.push(vectorAxis(vector, "x"));
-      chart.data.datasets[1].data.push(vectorAxis(vector, "y"));
-      chart.data.datasets[2].data.push(vectorAxis(vector, "z"));
+    function normalizeAccel(raw) {
+      return Math.abs(raw) > 20 ? raw / ACCEL_COUNTS_PER_G : raw;
+    }
+
+    function normalizeGyro(raw) {
+      return Math.abs(raw) > 1000 ? raw / GYRO_COUNTS_PER_DPS : raw;
+    }
+
+    function normalizeMag(raw) {
+      return raw;
+    }
+
+    function normalizeVector(v) {
+      const norm = Math.hypot(v.x, v.y, v.z);
+      if (!Number.isFinite(norm) || norm < 0.000001) return null;
+      return { x: v.x / norm, y: v.y / norm, z: v.z / norm };
+    }
+
+    function vectorDot(a, b) {
+      return (a.x * b.x) + (a.y * b.y) + (a.z * b.z);
+    }
+
+    function vectorCross(a, b) {
+      return {
+        x: (a.y * b.z) - (a.z * b.y),
+        y: (a.z * b.x) - (a.x * b.z),
+        z: (a.x * b.y) - (a.y * b.x)
+      };
+    }
+
+    function pushVector(chart, vector, timeMs, normalizer) {
+      chart.data.datasets[0].data.push({ x: timeMs, y: scaledAxis(vector, "x", normalizer) });
+      chart.data.datasets[1].data.push({ x: timeMs, y: scaledAxis(vector, "y", normalizer) });
+      chart.data.datasets[2].data.push({ x: timeMs, y: scaledAxis(vector, "z", normalizer) });
       trimChart(chart, timeMs);
+      chart.options.scales.x.min = timeMs - CHART_WINDOW_MS;
+      chart.options.scales.x.max = timeMs;
       chart.update("none");
     }
 
-    function pushButton(label, value, timeMs) {
-      const times = ensureChartTimes(charts.button);
-      charts.button.data.labels.push(label);
-      times.push(timeMs);
-      charts.button.data.datasets[0].data.push(value ? 1 : 0);
-      trimChart(charts.button, timeMs);
-      charts.button.update("none");
-      state.lastButton = value ? 1 : 0;
-      updateButtonState(state.lastButton);
+    function calibratedMagAxis(vector, axis) {
+      const raw = vectorAxis(vector, axis);
+      if (raw === null) return null;
+      const cal = state.magCal;
+      const offset = cal.offset[axis];
+      const scale = cal.scale[axis];
+      return (raw - offset) * scale;
+    }
+
+    function updateGravityEstimate(accelVector) {
+      const ax = scaledAxis(accelVector, "x", normalizeAccel);
+      const ay = scaledAxis(accelVector, "y", normalizeAccel);
+      const az = scaledAxis(accelVector, "z", normalizeAccel);
+      if (ax === null || ay === null || az === null) return;
+      const sample = normalizeVector({ x: ax, y: ay, z: az });
+      if (!sample) return;
+      if (!state.gravityEstimate) {
+        state.gravityEstimate = sample;
+        return;
+      }
+      const a = GRAVITY_LPF_ALPHA;
+      const blended = {
+        x: ((1 - a) * state.gravityEstimate.x) + (a * sample.x),
+        y: ((1 - a) * state.gravityEstimate.y) + (a * sample.y),
+        z: ((1 - a) * state.gravityEstimate.z) + (a * sample.z)
+      };
+      const normalized = normalizeVector(blended);
+      if (normalized) {
+        state.gravityEstimate = normalized;
+      }
+    }
+
+    function remapMagToImuFrame(magVector) {
+      const mx = calibratedMagAxis(magVector, "x");
+      const my = calibratedMagAxis(magVector, "y");
+      const mz = calibratedMagAxis(magVector, "z");
+      if (mx === null || my === null || mz === null) return null;
+      return {
+        // Puck magnetometer axes are swapped relative to accel/gyro axes.
+        x: my,
+        y: mx,
+        z: mz
+      };
+    }
+
+    function computeHeadingDeg(magVector) {
+      const up = state.gravityEstimate ? normalizeVector(state.gravityEstimate) : null;
+      const mag = remapMagToImuFrame(magVector);
+      if (!up || !mag) return null;
+
+      // Remove vertical component of magnetic field (tilt compensation).
+      const magVertical = vectorDot(mag, up);
+      const horizontalMag = {
+        x: mag.x - (magVertical * up.x),
+        y: mag.y - (magVertical * up.y),
+        z: mag.z - (magVertical * up.z)
+      };
+      if (!normalizeVector(horizontalMag)) return null;
+
+      // Project body X axis onto horizontal plane to define forward reference.
+      const bodyX = { x: 1, y: 0, z: 0 };
+      const bodyXVertical = vectorDot(bodyX, up);
+      let forward = {
+        x: bodyX.x - (bodyXVertical * up.x),
+        y: bodyX.y - (bodyXVertical * up.y),
+        z: bodyX.z - (bodyXVertical * up.z)
+      };
+      if (!normalizeVector(forward)) {
+        // Degenerate case if body X is aligned with up vector.
+        const bodyY = { x: 0, y: 1, z: 0 };
+        const bodyYVertical = vectorDot(bodyY, up);
+        forward = {
+          x: bodyY.x - (bodyYVertical * up.x),
+          y: bodyY.y - (bodyYVertical * up.y),
+          z: bodyY.z - (bodyYVertical * up.z)
+        };
+      }
+      const forwardNorm = normalizeVector(forward);
+      if (!forwardNorm) return null;
+      const rightNorm = normalizeVector(vectorCross(up, forwardNorm));
+      if (!rightNorm) return null;
+
+      const northComp = vectorDot(horizontalMag, forwardNorm);
+      const eastComp = vectorDot(horizontalMag, rightNorm);
+      const angle = Math.atan2(eastComp, northComp) * 180 / Math.PI;
+      return angle >= 0 ? angle : angle + 360;
+    }
+
+    function computeGLoad(accelVector) {
+      const x = scaledAxis(accelVector, "x", normalizeAccel);
+      const y = scaledAxis(accelVector, "y", normalizeAccel);
+      const z = scaledAxis(accelVector, "z", normalizeAccel);
+      if (x === null || y === null || z === null) return null;
+      return Math.sqrt((x * x) + (y * y) + (z * z));
+    }
+
+    function computeVerticalAccelG(accelVector) {
+      const up = state.gravityEstimate ? normalizeVector(state.gravityEstimate) : null;
+      if (!up) return null;
+      const x = scaledAxis(accelVector, "x", normalizeAccel);
+      const y = scaledAxis(accelVector, "y", normalizeAccel);
+      const z = scaledAxis(accelVector, "z", normalizeAccel);
+      if (x === null || y === null || z === null) return null;
+      const alongUp = (x * up.x) + (y * up.y) + (z * up.z);
+      return alongUp - 1;
+    }
+
+    function updateAutoMagCalibration(magVector, timeMs) {
+      const sample = {
+        x: vectorAxis(magVector, "x"),
+        y: vectorAxis(magVector, "y"),
+        z: vectorAxis(magVector, "z")
+      };
+      if (sample.x === null || sample.y === null || sample.z === null) return;
+
+      const cal = state.autoMagCal;
+      if (!cal.initialized) {
+        cal.initialized = true;
+        cal.lastUpdateMs = timeMs;
+        cal.lastSaveMs = timeMs;
+        cal.min = { ...sample };
+        cal.max = { ...sample };
+        return;
+      }
+
+      const dt = Math.max(0, Math.min(2000, timeMs - cal.lastUpdateMs)) / 1000;
+      cal.lastUpdateMs = timeMs;
+      const axes = ["x", "y", "z"];
+      for (const axis of axes) {
+        const span = cal.max[axis] - cal.min[axis];
+        const shrink = Math.max(0, span * AUTO_MAG_CAL_DECAY_PER_S * dt);
+        cal.min[axis] += shrink;
+        cal.max[axis] -= shrink;
+        if (sample[axis] < cal.min[axis]) cal.min[axis] = sample[axis];
+        if (sample[axis] > cal.max[axis]) cal.max[axis] = sample[axis];
+      }
+
+      const range = {
+        x: (cal.max.x - cal.min.x) / 2,
+        y: (cal.max.y - cal.min.y) / 2,
+        z: (cal.max.z - cal.min.z) / 2
+      };
+      if (range.x < AUTO_MAG_CAL_MIN_RANGE || range.y < AUTO_MAG_CAL_MIN_RANGE || range.z < AUTO_MAG_CAL_MIN_RANGE) {
+        return;
+      }
+
+      const avgRange = (range.x + range.y + range.z) / 3;
+      const target = {
+        offset: {
+          x: (cal.min.x + cal.max.x) / 2,
+          y: (cal.min.y + cal.max.y) / 2,
+          z: (cal.min.z + cal.max.z) / 2
+        },
+        scale: {
+          x: avgRange / range.x,
+          y: avgRange / range.y,
+          z: avgRange / range.z
+        }
+      };
+      const b = AUTO_MAG_CAL_BLEND;
+      for (const axis of axes) {
+        state.magCal.offset[axis] = ((1 - b) * state.magCal.offset[axis]) + (b * target.offset[axis]);
+        state.magCal.scale[axis] = ((1 - b) * state.magCal.scale[axis]) + (b * target.scale[axis]);
+      }
+
+      if (timeMs - cal.lastSaveMs > 5000) {
+        saveMagCalibration();
+        cal.lastSaveMs = timeMs;
+      }
+    }
+
+    function updateLiftSinkEstimator(verticalAccelG, sampleTimeMs) {
+      if (!Number.isFinite(verticalAccelG)) return null;
+      if (!Number.isFinite(state.vario.lastImuMs)) {
+        state.vario.lastImuMs = sampleTimeMs;
+        return state.vario.velocityMs;
+      }
+      const dt = Math.max(0, Math.min(1000, sampleTimeMs - state.vario.lastImuMs)) / 1000;
+      state.vario.lastImuMs = sampleTimeMs;
+      if (dt <= 0) return state.vario.velocityMs;
+
+      state.vario.velocityMs += verticalAccelG * EARTH_GRAVITY_MS2 * dt;
+      const damping = Math.max(0, 1 - (VARIO_IMU_DAMPING_PER_S * dt));
+      state.vario.velocityMs *= damping;
+
+      if (Number.isFinite(state.vario.gpsClimbMs)) {
+        const gpsAlpha = Math.min(1, dt / VARIO_GPS_BLEND_TIME_S);
+        state.vario.velocityMs = ((1 - gpsAlpha) * state.vario.velocityMs) + (gpsAlpha * state.vario.gpsClimbMs);
+      }
+      state.vario.velocityMs = Math.max(-20, Math.min(20, state.vario.velocityMs));
+      return state.vario.velocityMs;
+    }
+
+    function beginMagCalibration() {
+      if (!(state.device && state.device.gatt && state.device.gatt.connected)) {
+        appendLog("[warn] Connect to a puck before running heading setup.");
+        return;
+      }
+      if (!state.isStreaming) {
+        appendLog("[warn] Start the stream with the puck button before running heading setup.");
+        return;
+      }
+      const now = Date.now();
+      state.magCalibration.active = true;
+      state.magCalibration.startedAt = now;
+      state.magCalibration.endsAt = now + MAG_CALIBRATION_MS;
+      state.magCalibration.min = { x: Infinity, y: Infinity, z: Infinity };
+      state.magCalibration.max = { x: -Infinity, y: -Infinity, z: -Infinity };
+      setConnectedUi(true);
+      setStatus("Heading setup running...");
+      appendLog("[info] Heading setup started. For 15s, rotate the harness through as many orientations as possible.");
+    }
+
+    function processMagCalibrationSample(magVector) {
+      if (!state.magCalibration.active) return;
+      const min = state.magCalibration.min;
+      const max = state.magCalibration.max;
+      const axes = ["x", "y", "z"];
+      for (const axis of axes) {
+        const value = vectorAxis(magVector, axis);
+        if (value === null) continue;
+        if (value < min[axis]) min[axis] = value;
+        if (value > max[axis]) max[axis] = value;
+      }
+      if (Date.now() < state.magCalibration.endsAt) return;
+      finishMagCalibration();
+    }
+
+    function finishMagCalibration() {
+      if (!state.magCalibration.active) return;
+      state.magCalibration.active = false;
+      const min = state.magCalibration.min;
+      const max = state.magCalibration.max;
+      const range = {
+        x: (max.x - min.x) / 2,
+        y: (max.y - min.y) / 2,
+        z: (max.z - min.z) / 2
+      };
+      if (!(range.x > 0 && range.y > 0 && range.z > 0)) {
+        appendLog("[warn] Heading setup failed: insufficient magnetometer movement.");
+        setStatus(state.isStreaming ? "Streaming" : "Connected. Heading setup failed.");
+        setConnectedUi(true);
+        return;
+      }
+      const avgRange = (range.x + range.y + range.z) / 3;
+      state.magCal = {
+        offset: {
+          x: (min.x + max.x) / 2,
+          y: (min.y + max.y) / 2,
+          z: (min.z + max.z) / 2
+        },
+        scale: {
+          x: avgRange / range.x,
+          y: avgRange / range.y,
+          z: avgRange / range.z
+        }
+      };
+      const saved = saveMagCalibration();
+      appendLog("[info] Heading setup complete." + (saved ? " Calibration saved." : " Calibration active for this session only."));
+      setStatus(state.isStreaming ? "Streaming (heading calibrated)" : "Connected. Heading calibrated.");
+      setConnectedUi(true);
     }
 
     function clearAll() {
+      const now = Date.now();
       Object.values(charts).forEach((chart) => {
         chart.data.labels = [];
         chart.data.datasets.forEach((ds) => { ds.data = []; });
-        chart._timesMs = [];
+        chart.options.scales.x.min = now - CHART_WINDOW_MS;
+        chart.options.scales.x.max = now;
         chart.update();
       });
       state.sampleNumber = 0;
       state.recorded = [];
       state.logLines = 0;
       state.lastButton = null;
-      state.chartOriginMs = null;
+      state.headingDeg = null;
+      state.gLoad = null;
+      state.verticalAccelG = null;
+      state.liftSinkMs = null;
+      state.gravityEstimate = null;
+      state.autoMagCal.initialized = false;
+      state.autoMagCal.lastUpdateMs = 0;
+      state.autoMagCal.lastSaveMs = 0;
+      state.autoMagCal.min = null;
+      state.autoMagCal.max = null;
       ui.sampleCount.textContent = "0";
       ui.logCount.textContent = "0 lines";
       ui.log.textContent = "";
       updateButtonState(null);
+      updateHeadingValue(null);
+      updateGLoadValue(null);
+      updateVerticalAccelValue(null);
+      updateLiftSinkValue(null);
+      resetVarioEstimator();
+      updateGpsAltitude(null);
+      clearGpsTrack();
       ui.downloadBtn.disabled = true;
     }
 
@@ -665,20 +1304,47 @@
     function processData(msg) {
       const msgType = msg && typeof msg === "object" ? msg.type : "";
       if (msgType === "sample") {
+        if (!state.isStreaming) {
+          return;
+        }
         state.sampleNumber += 1;
         const chartTimeMs = toChartTimeMs(msg);
-        const label = formatElapsedLabel(chartTimeMs);
-        pushVector(charts.accel, label, msg.accel, chartTimeMs);
-        pushVector(charts.gyro, label, msg.gyro, chartTimeMs);
-        pushVector(charts.mag, label, msg.mag, chartTimeMs);
+        pushVector(charts.accel, msg.accel, chartTimeMs, normalizeAccel);
+        pushVector(charts.gyro, msg.gyro, chartTimeMs, normalizeGyro);
+        pushVector(charts.mag, msg.mag, chartTimeMs, normalizeMag);
+        updateGravityEstimate(msg.accel);
+        if (state.magCalibration.active) {
+          processMagCalibrationSample(msg.mag);
+        } else {
+          updateAutoMagCalibration(msg.mag, chartTimeMs);
+        }
+        state.headingDeg = computeHeadingDeg(msg.mag);
+        state.gLoad = computeGLoad(msg.accel);
+        state.verticalAccelG = computeVerticalAccelG(msg.accel);
+        state.liftSinkMs = updateLiftSinkEstimator(state.verticalAccelG, chartTimeMs);
+        updateHeadingValue(state.headingDeg);
+        updateGLoadValue(state.gLoad);
+        updateVerticalAccelValue(state.verticalAccelG);
+        updateLiftSinkValue(state.liftSinkMs);
+        if (Number.isFinite(state.vario.gpsClimbMs)) {
+          updateVarioSource("Fused IMU + GPS altitude");
+        } else {
+          updateVarioSource("IMU-only estimate (drift-prone). Start GPS for fusion.");
+        }
         if (msg.button !== undefined) {
-          pushButton(label, msg.button, chartTimeMs);
-        } else if (state.lastButton !== null) {
-          pushButton(label, state.lastButton, chartTimeMs);
+          state.lastButton = msg.button ? 1 : 0;
+          updateButtonState(state.lastButton);
         }
         state.recorded.push({
           localTimeMs: Date.now(),
           puckTimeMs: toMsTime(msg.time),
+          derived: {
+            headingDeg: state.headingDeg,
+            gLoad: state.gLoad,
+            verticalAccelG: state.verticalAccelG,
+            liftSinkMs: state.liftSinkMs,
+            gpsClimbMs: state.vario.gpsClimbMs
+          },
           ...msg
         });
         ui.sampleCount.textContent = String(state.sampleNumber);
@@ -687,9 +1353,8 @@
       }
 
       if (msgType === "button") {
-        const chartTimeMs = toChartTimeMs(msg);
-        const label = formatElapsedLabel(chartTimeMs);
-        pushButton(label, msg.value, chartTimeMs);
+        state.lastButton = msg.value ? 1 : 0;
+        updateButtonState(state.lastButton);
         state.recorded.push({
           localTimeMs: Date.now(),
           puckTimeMs: toMsTime(msg.time),
@@ -700,11 +1365,32 @@
       }
 
       if (msgType === "status") {
-        if (msg.message === "wario-stream-started" && msg.gyroAvailable === false) {
-          appendLog("[info] No gyroscope API exposed by this Puck firmware/hardware. Gyro chart will stay empty.");
+        if (msg.message === "wario-ready") {
+          state.isStreaming = !!msg.streaming;
+          setStatus("Connected. Press the puck button to start/stop stream.");
+          setConnectedUi(true);
         }
-        if (msg.message === "wario-stream-started" && msg.accelAvailable === false) {
-          appendLog("[info] No accelerometer API exposed by this Puck firmware/hardware. Accelerometer chart will stay empty.");
+        if (msg.message === "wario-stream-started") {
+          state.isStreaming = true;
+          setStatus("Streaming");
+          setConnectedUi(true);
+          updateVarioSource(state.gps.active ? "Fused IMU + GPS altitude (as GPS stabilizes)." : "IMU-only estimate (drift-prone). Start GPS for fusion.");
+          if (msg.gyroAvailable === false) {
+            appendLog("[info] No gyroscope API exposed by this Puck firmware/hardware. Gyro chart will stay empty.");
+          }
+          if (msg.accelAvailable === false) {
+            appendLog("[info] No accelerometer API exposed by this Puck firmware/hardware. Accelerometer chart will stay empty.");
+          }
+        }
+        if (msg.message === "wario-stream-stopped") {
+          if (state.magCalibration.active) {
+            state.magCalibration.active = false;
+            appendLog("[warn] Heading setup canceled because stream stopped.");
+          }
+          state.isStreaming = false;
+          setStatus("Connected. Stream stopped; press puck button to resume.");
+          updateVarioSource("Stream stopped.");
+          setConnectedUi(true);
         }
         return;
       }
@@ -749,35 +1435,53 @@
         "if (global.__warioW) clearWatch(global.__warioW);",
         "if (Puck.accelOn) Puck.accelOn();",
         "if (Puck.magOn) Puck.magOn();",
+        "global.__warioStreaming = false;",
         "function __warioSample(){",
         "  var a = (Puck.accel) ? Puck.accel() : null;",
         "  var g = (Puck.gyro) ? Puck.gyro() : null;",
         "  var m = (Puck.mag) ? Puck.mag() : null;",
         "  print(JSON.stringify({type:'sample',time:getTime(),accel:a,gyro:g,mag:m,button:digitalRead(BTN)?1:0}));",
         "}",
+        "function __warioStart(){",
+        "  if (global.__warioStreaming) return;",
+        "  global.__warioI = setInterval(__warioSample, 100);",
+        "  global.__warioStreaming = true;",
+        "  print(JSON.stringify({type:'status',time:getTime(),message:'wario-stream-started',gyroAvailable:!!Puck.gyro,accelAvailable:!!Puck.accel,magAvailable:!!Puck.mag}));",
+        "}",
+        "function __warioStop(){",
+        "  if (!global.__warioStreaming) return;",
+        "  if (global.__warioI) { clearInterval(global.__warioI); global.__warioI = undefined; }",
+        "  global.__warioStreaming = false;",
+        "  print(JSON.stringify({type:'status',time:getTime(),message:'wario-stream-stopped'}));",
+        "}",
         "global.__warioW = setWatch(function(){",
-        "  print(JSON.stringify({type:'button',time:getTime(),value:digitalRead(BTN)?1:0}));",
-        "}, BTN, {repeat:true,edge:'both',debounce:20});",
-        "global.__warioI = setInterval(__warioSample, 100);",
-        "print(JSON.stringify({type:'status',time:getTime(),message:'wario-stream-started',gyroAvailable:!!Puck.gyro,accelAvailable:!!Puck.accel,magAvailable:!!Puck.mag}));"
+        "  var btn = digitalRead(BTN)?1:0;",
+        "  print(JSON.stringify({type:'button',time:getTime(),value:btn}));",
+        "  if (!btn) return;",
+        "  if (global.__warioStreaming) __warioStop(); else __warioStart();",
+        "}, BTN, {repeat:true,edge:'both',debounce:0});",
+        "print(JSON.stringify({type:'status',time:getTime(),message:'wario-ready',streaming:false,gyroAvailable:!!Puck.gyro,accelAvailable:!!Puck.accel,magAvailable:!!Puck.mag}));"
       ].join("\n") + "\n";
       await writeToRx(script);
     }
 
-    async function stopStreamScript() {
+    async function teardownStreamScript() {
       if (!state.rxChar) return;
-      const stopScript = [
+      const teardownScript = [
         "\u0003",
         "if (global.__warioI) { clearInterval(global.__warioI); global.__warioI = undefined; }",
         "if (global.__warioW) { clearWatch(global.__warioW); global.__warioW = undefined; }",
-        "print(JSON.stringify({type:'status',time:getTime(),message:'wario-stream-stopped'}));"
+        "global.__warioStreaming = false;",
+        "print(JSON.stringify({type:'status',time:getTime(),message:'wario-disconnected'}));"
       ].join("\n") + "\n";
-      await writeToRx(stopScript);
+      await writeToRx(teardownScript);
     }
 
     function setConnectedUi(connected) {
-      ui.connectBtn.disabled = connected;
-      ui.stopBtn.disabled = !connected;
+      ui.connectBtn.disabled = false;
+      ui.connectBtn.textContent = connected ? "Disconnect Puck.js" : "Connect Puck.js";
+      ui.setupBtn.disabled = !connected || state.magCalibration.active || !state.isStreaming;
+      ui.setupBtn.textContent = state.magCalibration.active ? "Setting Up..." : "Setup Heading (Optional)";
     }
 
     async function requestPuckDevice() {
@@ -825,9 +1529,19 @@
         state.txChar = await service.getCharacteristic(NUS_TX_UUID);
         state.txChar.addEventListener("characteristicvaluechanged", onNotification);
         await state.txChar.startNotifications();
+        state.magCal = loadMagCalibration();
+        state.autoMagCal.initialized = false;
+        state.autoMagCal.lastUpdateMs = 0;
+        state.autoMagCal.lastSaveMs = 0;
+        state.autoMagCal.min = null;
+        state.autoMagCal.max = null;
+        resetVarioEstimator();
+        appendLog(hasStoredMagCalibration()
+          ? "[info] Loaded saved heading calibration for this puck."
+          : "[info] No saved heading calibration yet. Auto heading correction will build one as you move.");
         setStatus("Connected to " + (state.device.name || "Puck.js"));
         await uploadStreamScript();
-        appendLog("[info] Streaming started.");
+        appendLog("[info] Connected. Press puck button to start/stop stream.");
         setConnectedUi(true);
       } catch (err) {
         if (err && err.name === "NotFoundError") {
@@ -843,26 +1557,45 @@
 
     async function disconnectPuck() {
       try {
-        await stopStreamScript();
+        await teardownStreamScript();
       } catch (err) {
-        appendLog("[warn] Could not send stop command: " + (err && err.message ? err.message : String(err)));
+        appendLog("[warn] Could not send teardown command: " + (err && err.message ? err.message : String(err)));
       }
       if (state.device && state.device.gatt && state.device.gatt.connected) {
         state.device.gatt.disconnect();
+      } else {
+        onDisconnected();
       }
-      onDisconnected();
     }
 
     function onDisconnected() {
       if (state.txChar) {
         state.txChar.removeEventListener("characteristicvaluechanged", onNotification);
       }
+      state.device = null;
       state.server = null;
       state.rxChar = null;
       state.txChar = null;
       state.lineBuffer = "";
+      state.isStreaming = false;
+      state.magCalibration.active = false;
+      state.headingDeg = null;
+      state.gLoad = null;
+      state.verticalAccelG = null;
+      state.liftSinkMs = null;
+      state.gravityEstimate = null;
+      state.autoMagCal.initialized = false;
+      state.autoMagCal.lastUpdateMs = 0;
+      state.autoMagCal.lastSaveMs = 0;
+      state.autoMagCal.min = null;
+      state.autoMagCal.max = null;
+      resetVarioEstimator();
       setStatus("Disconnected");
       appendLog("[info] Disconnected.");
+      updateHeadingValue(null);
+      updateGLoadValue(null);
+      updateVerticalAccelValue(null);
+      updateLiftSinkValue(null);
       setConnectedUi(false);
     }
 
@@ -882,10 +1615,28 @@
       URL.revokeObjectURL(url);
     }
 
-    ui.connectBtn.addEventListener("click", connectPuck);
-    ui.stopBtn.addEventListener("click", disconnectPuck);
+    ui.connectBtn.addEventListener("click", () => {
+      if (state.device && state.device.gatt && state.device.gatt.connected) {
+        disconnectPuck();
+      } else {
+        connectPuck();
+      }
+    });
+    ui.setupBtn.addEventListener("click", beginMagCalibration);
+    ui.gpsBtn.addEventListener("click", toggleGpsTracking);
     ui.clearBtn.addEventListener("click", clearAll);
     ui.downloadBtn.addEventListener("click", downloadJson);
+
+    initMap();
+    setConnectedUi(false);
+    updateHeadingValue(null);
+    updateGLoadValue(null);
+    updateVerticalAccelValue(null);
+    updateLiftSinkValue(null);
+    updateVarioSource("Waiting for IMU/GPS data.");
+    updateGpsState();
+    updateGpsAltitude(null);
+    window.addEventListener("beforeunload", stopGpsTracking);
 
     if (!window.isSecureContext) {
       ui.secureWarning.hidden = false;
